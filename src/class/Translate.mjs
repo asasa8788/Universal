@@ -396,8 +396,8 @@ export default class Translate {
 
 	// DeepLX：自建 DeepL 兼容服务（协议定稿 Docs/03 §8）
 	// 令牌桶与全局暂停为类级共享：同一次脚本执行内所有并发分片共用（Docs/03 §8.2）
-	static #Bucket = { tokens: 10, last: Date.now(), rate: 3, capacity: 10 }; // 3 req/s，桶 10
-	static #Pause = { until: 0, delay: 1000 }; // 429/5xx 全局暂停，指数退避 1s→8s 封顶
+	static #Bucket = { tokens: 10, last: Date.now(), rate: 2, capacity: 10 }; // 2 req/s，桶 10（Docs/07 第二轮：3/s 并发突发会触发 DeepL 限流）
+	static #Pause = { until: 0, delay: 1000 }; // 429/5xx 全局暂停，指数退避 1s→30s 封顶（盖过 DeepL ~1 分钟限流窗口）
 
 	async DeepLX(text = [], source = this.Source, target = this.Target, api = this.API) {
 		text = Array.isArray(text) ? text : [text];
@@ -435,7 +435,8 @@ export default class Translate {
 				batch.forEach((line, index) => map.set(line, lines[index]));
 			} catch (error) {
 				// 段数对账失败 → 自动降级为逐行请求（单行不拆分，免疫服务端段落合并/拆分行为）
-				if (batch.length > 1 && String(error?.message ?? "").includes("对账失败")) {
+				// 防放大闸门：限流暂停激活期间禁止降级（逐行 ×18 会放大风暴），直接抛给编排器重试
+				if (batch.length > 1 && String(error?.message ?? "").includes("对账失败") && Translate.#Pause.until <= Date.now()) {
 					Console.warn(`DeepLX: 批量(${batch.length}行)对账失败，自动降级为逐行请求`);
 					for (const line of batch) {
 						const single = await this.#DeepLXFetch({ ...request, body: JSON.stringify({ text: line, source_lang: source, target_lang: target }) }, 1);
@@ -471,7 +472,7 @@ export default class Translate {
 
 	static #pause() {
 		Translate.#Pause.until = Date.now() + Translate.#Pause.delay;
-		Translate.#Pause.delay = Math.min(Translate.#Pause.delay * 2, 8000);
+		Translate.#Pause.delay = Math.min(Translate.#Pause.delay * 2, 30000);
 	}
 
 	async #DeepLXFetch(request, expectLines) {
