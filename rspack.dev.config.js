@@ -52,6 +52,16 @@ export default defineConfig({
 			banner: pkg.homepage,
 		}),
 	],
+	module: {
+		rules: [
+			{
+				test: /.m?js/,
+				resolve: {
+					fullySpecified: false,
+				},
+			},
+		],
+	},
 	devtool: false,
 	performance: false,
 });
