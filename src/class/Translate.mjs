@@ -4,7 +4,7 @@ import MD5 from "crypto-js/md5.js";
 export default class Translate {
 	constructor(options = {}) {
 		this.Name = "Translate";
-		this.Version = "1.0.7";
+		this.Version = "1.0.8";
 		Console.log(`🟧 ${this.Name} v${this.Version}`);
 		this.Source = "AUTO";
 		this.Target = "ZH";
@@ -392,6 +392,83 @@ export default class Translate {
 				return body?.translations?.map(item => item?.text ?? `翻译失败, vendor: ${"DeepL"}`);
 			})
 			.catch(error => Promise.reject(error));
+	}
+
+	// DeepLX：自建 DeepL 兼容服务（协议定稿 Docs/03 §8）
+	// 令牌桶与全局暂停为类级共享：同一次脚本执行内所有并发分片共用（Docs/03 §8.2）
+	static #Bucket = { tokens: 10, last: Date.now(), rate: 3, capacity: 10 }; // 3 req/s，桶 10
+	static #Pause = { until: 0, delay: 1000 }; // 429/5xx 全局暂停，指数退避 1s→8s 封顶
+
+	async DeepLX(text = [], source = this.Source, target = this.Target, api = this.API) {
+		text = Array.isArray(text) ? text : [text];
+		source = this.#LanguagesCode.DeepL[source] ?? this.#LanguagesCode.DeepL[source?.split?.(/[-_]/)?.[0]] ?? source.toLowerCase();
+		target = this.#LanguagesCode.DeepL[target] ?? this.#LanguagesCode.DeepL[target?.split?.(/[-_]/)?.[0]] ?? target.toLowerCase();
+		if (!api?.Endpoint) return text.map(() => `翻译失败, vendor: DeepLX(未配置 Endpoint)`);
+		// 行级去重：相同行仅请求一次，结果回填（YouTube 字幕重复行多）
+		const unique = [...new Set(text)];
+		// 字符级二次分片：单请求 ≤1400 字符（服务端硬上限 1500 含分隔符，Docs/03 §8.1）；含 "||" 的行隔离为单行批
+		const batches = [];
+		let current = [];
+		for (const line of unique) {
+			if (current.length && (current.join("||").length + 2 + line.length > 1400 || line.includes("||"))) {
+				batches.push(current);
+				current = [];
+			}
+			current.push(line);
+		}
+		if (current.length) batches.push(current);
+		const result = [];
+		for (const batch of batches) {
+			const headers = { "Content-Type": "application/json", "User-Agent": "DualSubs", Accept: "*/*" };
+			const token = api?.Token ?? api?.Auth; // Token ?? Auth 整体判断（修正 v1.2 仅识别 Token）
+			if (token) headers.Authorization = `Bearer ${token}`;
+			result.push(...await this.#DeepLXFetch({
+				url: api.Endpoint,
+				headers,
+				body: JSON.stringify({ text: batch.join("||"), source_lang: source, target_lang: target }),
+				timeout: 15, // $httpClient 默认 5s 不足（Docs/03 §8.3）
+			}, batch.length));
+		}
+		if (result.length !== unique.length) throw new Error(`DeepLX: 行数对账失败 (${result.length} != ${unique.length})`);
+		const map = new Map(unique.map((line, index) => [line, result[index]]));
+		return text.map(line => map.get(line));
+	}
+
+	static async #waitToken() {
+		for (;;) {
+			const now = Date.now();
+			if (now < Translate.#Pause.until) {
+				await new Promise(resolve => setTimeout(resolve, Translate.#Pause.until - now));
+				continue;
+			}
+			const bucket = Translate.#Bucket;
+			bucket.tokens = Math.min(bucket.capacity, bucket.tokens + (now - bucket.last) / 1000 * bucket.rate);
+			bucket.last = now;
+			if (bucket.tokens >= 1) {
+				bucket.tokens--;
+				return;
+			}
+			await new Promise(resolve => setTimeout(resolve, Math.ceil((1 - bucket.tokens) / bucket.rate * 1000)));
+		}
+	}
+
+	static #pause() {
+		Translate.#Pause.until = Date.now() + Translate.#Pause.delay;
+		Translate.#Pause.delay = Math.min(Translate.#Pause.delay * 2, 8000);
+	}
+
+	async #DeepLXFetch(request, expectLines) {
+		await Translate.#waitToken();
+		const response = await fetch(request);
+		if (response.status === 429 || response.status >= 500) {
+			Translate.#pause(); // 全局暂停后抛出，由编排器 retry 退避接管
+			throw new Error(`DeepLX: HTTP ${response.status}`);
+		}
+		const result = JSON.parse(response.body);
+		if (result?.code !== 200) throw new Error(`DeepLX: code=${result?.code} ${result?.message ?? ""}`);
+		const lines = expectLines === 1 ? [result.data] : result.data.split("||");
+		if (lines.length !== expectLines) throw new Error(`DeepLX: 行数对账失败 (${lines.length} != ${expectLines})`);
+		return lines;
 	}
 
 	async BaiduFanyi(text = [], source = this.Source, target = this.Target, api = this.API) {

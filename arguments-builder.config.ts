@@ -95,6 +95,7 @@ export default defineConfig({
 			options: [
 				{ key: "Google", label: "Google Translate" },
 				{ key: "Microsoft", label: "Microsoft Translator（需填写API）" },
+				{ key: "DeepLX", label: "DeepLX（自建，需填写Endpoint）" },
 			],
 			description: "请选择翻译器所使用的服务商API，更多翻译选项请使用BoxJs。",
 		},
