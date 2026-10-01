@@ -14,6 +14,7 @@ jobs:
     uses: ./.github/workflows/dev.yml
     secrets: inherit
   deploy:
+    if: false # 二开：不向原作者 gist 推送（自建 gist 后移除本行，见 Docs/11 C-5）
     needs: dev
     runs-on: ubuntu-latest
     steps:
