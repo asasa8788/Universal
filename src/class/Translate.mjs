@@ -404,51 +404,34 @@ export default class Translate {
 		source = this.#LanguagesCode.DeepL[source] ?? this.#LanguagesCode.DeepL[source?.split?.(/[-_]/)?.[0]] ?? source.toLowerCase();
 		target = this.#LanguagesCode.DeepL[target] ?? this.#LanguagesCode.DeepL[target?.split?.(/[-_]/)?.[0]] ?? target.toLowerCase();
 		if (!api?.Endpoint) return text.map(() => `翻译失败, vendor: DeepLX(未配置 Endpoint)`);
-		// 行级去重：相同行仅请求一次，结果回填（YouTube 字幕重复行多）
-		const unique = [...new Set(text)];
-		// 空行过滤：空行无需翻译，直接原样返回（避免 "a||||b" 段数歧义导致对账失败）
-		const translatable = unique.filter(line => line.trim() !== "");
-		// 字符级二次分片：单请求 ≤1400 字符（服务端硬上限 1500 含分隔符，Docs/03 §8.1）；含 "||" 的行隔离为单行批
-		const batches = [];
-		let current = [];
-		for (const line of translatable) {
-			if (current.length && (current.join("||").length + 2 + line.length > 1400 || line.includes("||"))) {
-				batches.push(current);
-				current = [];
-			}
-			current.push(line);
-		}
-		if (current.length) batches.push(current);
+		// v2 数组协议端点派生：.../translate → .../v2/translate（服务端逐条独立翻译：
+		// 无段数漂移、无回显连坐、按条缓存跨视频复用——Docs/07 第三轮定稿）
+		const endpoint = api.Endpoint.replace(/\/translate\/?(\?.*)?$/, "/v2/translate");
 		const headers = { "Content-Type": "application/json", "User-Agent": "DualSubs", Accept: "*/*" };
-		const token = api?.Token ?? api?.Auth; // Token ?? Auth 整体判断（修正 v1.2 仅识别 Token）
+		const token = api?.Token ?? api?.Auth; // Token ?? Auth 整体判断
 		if (token) headers.Authorization = `Bearer ${token}`;
+		// 行级去重 + 空行过滤：相同行仅请求一次；空行无需翻译，原样返回
+		const unique = [...new Set(text)];
+		const translatable = unique.filter(line => line.trim() !== "");
+		// 失败隔离分批：每批 ≤20 条（与编排器 Part 粒度对齐）；批失败 → 该批回填原文，响应永远完整
+		const batches = [];
+		for (let index = 0; index < translatable.length; index += 20) batches.push(translatable.slice(index, index + 20));
 		const map = new Map();
 		for (const batch of batches) {
-			const request = {
-				url: api.Endpoint,
-				headers,
-				body: JSON.stringify({ text: batch.join("||"), source_lang: source, target_lang: target }),
-				timeout: 15, // $httpClient 默认 5s 不足（Docs/03 §8.3）
-			};
 			try {
-				const lines = await this.#DeepLXFetch(request, batch.length);
-				batch.forEach((line, index) => map.set(line, lines[index]));
+				const translations = await this.#DeepLXFetch({
+					url: endpoint,
+					headers,
+					body: JSON.stringify({ text: batch, source_lang: source, target_lang: target }),
+					timeout: 30, // 服务端受控并发逐条处理，长批放宽超时（Docs/03 §8.3）
+				});
+				batch.forEach((line, index) => map.set(line, translations[index] ?? line));
 			} catch (error) {
-				// 段数对账失败 → 自动降级为逐行请求（单行不拆分，免疫服务端段落合并/拆分行为）
-				// 防放大闸门：限流暂停激活期间禁止降级（逐行 ×18 会放大风暴），直接抛给编排器重试
-				if (batch.length > 1 && String(error?.message ?? "").includes("对账失败") && Translate.#Pause.until <= Date.now()) {
-					Console.warn(`DeepLX: 批量(${batch.length}行)对账失败，自动降级为逐行请求`);
-					for (const line of batch) {
-						const single = await this.#DeepLXFetch({ ...request, body: JSON.stringify({ text: line, source_lang: source, target_lang: target }) }, 1);
-						map.set(line, single[0]);
-					}
-				} else {
-					Console.error(`DeepLX: 批量(${batch.length}行)请求失败`, error?.message ?? error);
-					throw error;
-				}
+				// 失败隔离：本批回填原文，绝不整体失败（Docs/07 第三轮：全有或全无 → 永远显示）
+				Console.error(`DeepLX: 批量(${batch.length}条)失败，本批回填原文`, error?.message ?? error);
+				batch.forEach(line => map.set(line, line));
 			}
 		}
-		if (map.size !== translatable.length) throw new Error(`DeepLX: 行数对账失败 (${map.size} != ${translatable.length})`);
 		return text.map(line => map.get(line) ?? line); // 空行原样返回
 	}
 
@@ -475,12 +458,12 @@ export default class Translate {
 		Translate.#Pause.delay = Math.min(Translate.#Pause.delay * 2, 30000);
 	}
 
-	async #DeepLXFetch(request, expectLines) {
+	async #DeepLXFetch(request) {
 		await Translate.#waitToken();
 		const response = await fetch(request);
 		if (response.status === 429 || response.status >= 500) {
 			Translate.#pause(); // 全局暂停后抛出，由编排器 retry 退避接管
-			Console.error(`DeepLX: HTTP ${response.status}（服务端限频/故障，已全局暂停）`);
+			Console.error(`DeepLX: HTTP ${response.status}（上游限频/故障，已全局暂停）`);
 			throw new Error(`DeepLX: HTTP ${response.status}`);
 		}
 		let result;
@@ -490,16 +473,12 @@ export default class Translate {
 			Console.error(`DeepLX: 响应非 JSON（HTTP ${response.status}）`, String(response.body ?? "").slice(0, 120));
 			throw new Error(`DeepLX: 响应非 JSON`);
 		}
-		if (result?.code !== 200) {
-			Console.error(`DeepLX: code=${result?.code}`, result?.message ?? "");
-			throw new Error(`DeepLX: code=${result?.code} ${result?.message ?? ""}`);
+		const translations = Array.isArray(result?.translations) ? result.translations.map(item => String(item?.text ?? "")) : null;
+		if (!translations) {
+			Console.error(`DeepLX: 响应缺少 translations（HTTP ${response.status}）`, JSON.stringify(result).slice(0, 120));
+			throw new Error(`DeepLX: 响应缺少 translations`);
 		}
-		const lines = expectLines === 1 ? [result.data] : String(result.data ?? "").split("||");
-		if (lines.length !== expectLines) {
-			Console.error(`DeepLX: 行数对账失败（期望 ${expectLines} 行，实际返回 ${lines.length} 行）`);
-			throw new Error(`DeepLX: 行数对账失败 (${lines.length} != ${expectLines})`);
-		}
-		return lines;
+		return translations;
 	}
 
 	async BaiduFanyi(text = [], source = this.Source, target = this.Target, api = this.API) {
