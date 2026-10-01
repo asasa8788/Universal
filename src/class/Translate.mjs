@@ -406,10 +406,12 @@ export default class Translate {
 		if (!api?.Endpoint) return text.map(() => `翻译失败, vendor: DeepLX(未配置 Endpoint)`);
 		// 行级去重：相同行仅请求一次，结果回填（YouTube 字幕重复行多）
 		const unique = [...new Set(text)];
+		// 空行过滤：空行无需翻译，直接原样返回（避免 "a||||b" 段数歧义导致对账失败）
+		const translatable = unique.filter(line => line.trim() !== "");
 		// 字符级二次分片：单请求 ≤1400 字符（服务端硬上限 1500 含分隔符，Docs/03 §8.1）；含 "||" 的行隔离为单行批
 		const batches = [];
 		let current = [];
-		for (const line of unique) {
+		for (const line of translatable) {
 			if (current.length && (current.join("||").length + 2 + line.length > 1400 || line.includes("||"))) {
 				batches.push(current);
 				current = [];
@@ -417,21 +419,36 @@ export default class Translate {
 			current.push(line);
 		}
 		if (current.length) batches.push(current);
-		const result = [];
+		const headers = { "Content-Type": "application/json", "User-Agent": "DualSubs", Accept: "*/*" };
+		const token = api?.Token ?? api?.Auth; // Token ?? Auth 整体判断（修正 v1.2 仅识别 Token）
+		if (token) headers.Authorization = `Bearer ${token}`;
+		const map = new Map();
 		for (const batch of batches) {
-			const headers = { "Content-Type": "application/json", "User-Agent": "DualSubs", Accept: "*/*" };
-			const token = api?.Token ?? api?.Auth; // Token ?? Auth 整体判断（修正 v1.2 仅识别 Token）
-			if (token) headers.Authorization = `Bearer ${token}`;
-			result.push(...await this.#DeepLXFetch({
+			const request = {
 				url: api.Endpoint,
 				headers,
 				body: JSON.stringify({ text: batch.join("||"), source_lang: source, target_lang: target }),
 				timeout: 15, // $httpClient 默认 5s 不足（Docs/03 §8.3）
-			}, batch.length));
+			};
+			try {
+				const lines = await this.#DeepLXFetch(request, batch.length);
+				batch.forEach((line, index) => map.set(line, lines[index]));
+			} catch (error) {
+				// 段数对账失败 → 自动降级为逐行请求（单行不拆分，免疫服务端段落合并/拆分行为）
+				if (batch.length > 1 && String(error?.message ?? "").includes("对账失败")) {
+					Console.warn(`DeepLX: 批量(${batch.length}行)对账失败，自动降级为逐行请求`);
+					for (const line of batch) {
+						const single = await this.#DeepLXFetch({ ...request, body: JSON.stringify({ text: line, source_lang: source, target_lang: target }) }, 1);
+						map.set(line, single[0]);
+					}
+				} else {
+					Console.error(`DeepLX: 批量(${batch.length}行)请求失败`, error?.message ?? error);
+					throw error;
+				}
+			}
 		}
-		if (result.length !== unique.length) throw new Error(`DeepLX: 行数对账失败 (${result.length} != ${unique.length})`);
-		const map = new Map(unique.map((line, index) => [line, result[index]]));
-		return text.map(line => map.get(line));
+		if (map.size !== translatable.length) throw new Error(`DeepLX: 行数对账失败 (${map.size} != ${translatable.length})`);
+		return text.map(line => map.get(line) ?? line); // 空行原样返回
 	}
 
 	static async #waitToken() {
@@ -462,12 +479,25 @@ export default class Translate {
 		const response = await fetch(request);
 		if (response.status === 429 || response.status >= 500) {
 			Translate.#pause(); // 全局暂停后抛出，由编排器 retry 退避接管
+			Console.error(`DeepLX: HTTP ${response.status}（服务端限频/故障，已全局暂停）`);
 			throw new Error(`DeepLX: HTTP ${response.status}`);
 		}
-		const result = JSON.parse(response.body);
-		if (result?.code !== 200) throw new Error(`DeepLX: code=${result?.code} ${result?.message ?? ""}`);
-		const lines = expectLines === 1 ? [result.data] : result.data.split("||");
-		if (lines.length !== expectLines) throw new Error(`DeepLX: 行数对账失败 (${lines.length} != ${expectLines})`);
+		let result;
+		try {
+			result = JSON.parse(response.body);
+		} catch {
+			Console.error(`DeepLX: 响应非 JSON（HTTP ${response.status}）`, String(response.body ?? "").slice(0, 120));
+			throw new Error(`DeepLX: 响应非 JSON`);
+		}
+		if (result?.code !== 200) {
+			Console.error(`DeepLX: code=${result?.code}`, result?.message ?? "");
+			throw new Error(`DeepLX: code=${result?.code} ${result?.message ?? ""}`);
+		}
+		const lines = expectLines === 1 ? [result.data] : String(result.data ?? "").split("||");
+		if (lines.length !== expectLines) {
+			Console.error(`DeepLX: 行数对账失败（期望 ${expectLines} 行，实际返回 ${lines.length} 行）`);
+			throw new Error(`DeepLX: 行数对账失败 (${lines.length} != ${expectLines})`);
+		}
 		return lines;
 	}
 
