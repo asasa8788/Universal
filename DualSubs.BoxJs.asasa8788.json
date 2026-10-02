@@ -832,6 +832,10 @@
 						{
 							"key": "DeepLX",
 							"label": "DeepL X（需填写API）"
+						},
+						{
+							"key": "Aggregate",
+							"label": "聚合翻译（自建·火山/彩云/腾讯）"
 						}
 					]
 				},
@@ -1122,6 +1126,45 @@
 					"type": "text",
 					"placeholder": "1234567",
 					"desc": "请填写令牌(Token)或密钥(Key)，没有设置密钥时，请留空"
+				},
+				{
+					"id": "@DualSubs.API.Settings.Aggregate.Endpoint",
+					"name": "[聚合翻译] 接入地址",
+					"val": "https://aggregate-translate.tempmail16.workers.dev",
+					"type": "text",
+					"desc": "自建聚合翻译服务（已预填）"
+				},
+				{
+					"id": "@DualSubs.API.Settings.Aggregate.Auth",
+					"name": "[聚合翻译] X-API-Key",
+					"val": "cf-key-8t3w5r8n2e",
+					"type": "text",
+					"desc": "已预填，勿外传"
+				},
+				{
+					"id": "@DualSubs.API.Settings.Aggregate.Service",
+					"name": "[聚合翻译] 翻译引擎",
+					"val": "volcengine",
+					"type": "selects",
+					"items": [
+						{
+							"key": "volcengine",
+							"label": "火山（最快）"
+						},
+						{
+							"key": "caiyun",
+							"label": "彩云（质量最好）"
+						},
+						{
+							"key": "tencent",
+							"label": "腾讯翻译君"
+						},
+						{
+							"key": "transmart",
+							"label": "腾讯交互翻译"
+						}
+					],
+					"desc": "留空则自动选路"
 				}
 			],
 			"author": "@DualSubs",

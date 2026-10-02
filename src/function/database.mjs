@@ -473,6 +473,11 @@ export default {
 				Endpoint: "",
 				Auth: "",
 			},
+			Aggregate: {
+				Endpoint: "https://aggregate-translate.tempmail16.workers.dev",
+				Auth: "cf-key-8t3w5r8n2e",
+				Service: "volcengine",
+			},
 			URL: "",
 			NeteaseMusic: {
 				PhoneNumber: "",

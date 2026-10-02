@@ -394,10 +394,13 @@ export default class Translate {
 			.catch(error => Promise.reject(error));
 	}
 
-	// DeepLX：自建 DeepL 兼容服务（协议定稿 Docs/03 §8）
-	// 令牌桶与全局暂停为类级共享：同一次脚本执行内所有并发分片共用（Docs/03 §8.2）
-	static #Bucket = { tokens: 10, last: Date.now(), rate: 2, capacity: 10 }; // 2 req/s，桶 10（Docs/07 第二轮：3/s 并发突发会触发 DeepL 限流）
-	static #Pause = { until: 0, delay: 1000 }; // 429/5xx 全局暂停，指数退避 1s→30s 封顶（盖过 DeepL ~1 分钟限流窗口）
+	// DeepLX：DeepL 兼容 v2 数组协议（服务端 /v2/translate 逐条独立翻译，Docs/07 第三轮定稿）
+	static #Bucket = { tokens: 10, last: Date.now(), rate: 2, capacity: 10 }; // 2 req/s，桶 10（并发突发会触发 DeepL 限流）
+	// Aggregate：聚合翻译（自建 CF 免费版，协议：A:/Github/聚合翻译/cf/API使用文档-CF免费版.md）
+	// 并发信号量为类级共享：服务方硬规则并发 ≤3；逐行请求天然无段数漂移/回显连坐
+	static #Inflight = 0;
+	static #AggregateLanguages = { AUTO: "auto", EN: "en", JA: "ja", KO: "ko", FR: "fr", ES: "es", DE: "de", IT: "it", RU: "ru", PT: "pt", TR: "tr", VI: "vi", ID: "id", TH: "th", MS: "ms", AR: "ar", HI: "hi", KM: "km", ZH: "zh-Hans", "ZH-HANS": "zh-Hans", "ZH-HANT": "zh-Hant", "ZH-HK": "zh-Hant" };
+	static #Pause = { until: 0, delay: 1000 }; // 429/502 全局暂停（各厂商共享），指数退避 1s→30s 封顶（服务方守则：等 1-2 秒重试）
 
 	async DeepLX(text = [], source = this.Source, target = this.Target, api = this.API) {
 		text = Array.isArray(text) ? text : [text];
@@ -433,6 +436,78 @@ export default class Translate {
 			}
 		}
 		return text.map(line => map.get(line) ?? line); // 空行原样返回
+	}
+
+	// 聚合翻译：CF 免费版（单文本接口逐行请求；服务方硬规则并发 ≤3、429/502 等 1-2 秒重试）
+	async Aggregate(text = [], source = this.Source, target = this.Target, api = this.API) {
+		text = Array.isArray(text) ? text : [text];
+		const from = this.#AggregateLanguages[source] ?? this.#AggregateLanguages[source?.split?.(/[-_]/)?.[0]] ?? "auto";
+		const to = this.#AggregateLanguages[target] ?? this.#AggregateLanguages[target?.split?.(/[-_]/)?.[0]] ?? target.toLowerCase();
+		if (!api?.Endpoint) return text.map(() => `翻译失败, vendor: Aggregate(未配置 Endpoint)`);
+		const base = String(api.Endpoint).replace(/\/+$/, "");
+		const endpoint = base.endsWith("/v1/translate") ? base : `${base}/v1/translate`;
+		const headers = { "Content-Type": "application/json", "X-API-Key": api?.Auth ?? "", "User-Agent": "DualSubs" };
+		const unique = [...new Set(text)];
+		const translatable = unique.filter(line => line.trim() !== "");
+		const map = new Map();
+		await Promise.all(translatable.map(async line => {
+			try {
+				map.set(line, await this.#AggregateFetch(line, from, to, api, endpoint, headers));
+			} catch (error) {
+				Console.error(`Aggregate: 单行翻译失败，回填原文`, error?.message ?? error);
+				map.set(line, line);
+			}
+		}));
+		return text.map(line => map.get(line) ?? line); // 空行原样返回
+	}
+
+	static async #waitSlot() {
+		for (;;) {
+			const now = Date.now();
+			if (now < Translate.#Pause.until) { // 服务方守则：429/502 后等 1-2 秒再发
+				await new Promise(resolve => setTimeout(resolve, Math.min(Translate.#Pause.until - now, 500)));
+				continue;
+			}
+			if (Translate.#Inflight < 3) {
+				Translate.#Inflight++;
+				return;
+			}
+			await new Promise(resolve => setTimeout(resolve, 100));
+		}
+	}
+
+	async #AggregateFetch(text, from, to, api, endpoint, headers) {
+		const body = { text, to };
+		if (from && from !== "auto") body.from = from;
+		const service = String(api?.Service ?? "").trim();
+		if (service) body.service = service;
+		await Translate.#waitSlot();
+		try {
+			for (let attempt = 0; attempt < 2; attempt++) {
+				try {
+					const response = await fetch({ url: endpoint, headers, body: JSON.stringify(body), timeout: 20 });
+					let result;
+					try {
+						result = JSON.parse(response.body);
+					} catch {
+						throw new Error(`响应非 JSON（HTTP ${response.status}）`);
+					}
+					if (result?.code !== 0) throw new Error(`code=${result?.code} ${result?.message ?? ""}`);
+					return String(result?.data?.text ?? "");
+				} catch (error) {
+					const message = String(error?.message ?? "");
+					// 服务方守则：429/502 等 1-2 秒重试一次；其余错误直接上抛（单行失败=回填原文，不连坐）
+					if (attempt === 0 && /HTTP (429|5\d\d)/.test(message)) {
+						Translate.#pause();
+						await new Promise(resolve => setTimeout(resolve, Translate.#Pause.delay));
+						continue;
+					}
+					throw error;
+				}
+			}
+		} finally {
+			Translate.#Inflight--;
+		}
 	}
 
 	static async #waitToken() {
